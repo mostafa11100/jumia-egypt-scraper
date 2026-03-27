@@ -344,19 +344,20 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
                     slug = warmup_url.rstrip("/").split("/")[-1] or "home"
 
                     # If Cloudflare serves a JS challenge ("Just a moment..."),
-                    # wait for real Chrome to solve it and redirect to the real page.
+                    # wait for networkidle so Chrome can execute the challenge JS,
+                    # complete its XHR requests to Cloudflare, and redirect to the real page.
                     if "just a moment" in title.lower():
-                        log.info(f"Warmup [{slug}]: CF challenge — waiting up to 35s for Chrome to solve …")
+                        log.info(f"Warmup [{slug}]: CF challenge — waiting up to 60s (networkidle) …")
                         try:
-                            await page.wait_for_function(
-                                "() => !document.title.toLowerCase().includes('just a moment')",
-                                timeout=35000,
-                            )
-                            title = await page.title()
+                            await page.wait_for_load_state("networkidle", timeout=60000)
+                        except Exception:
+                            pass  # timeout is fine — check title below
+                        title = await page.title()
+                        if "just a moment" not in title.lower():
                             status = 200  # challenge solved → real page loaded
                             log.info(f"Warmup [{slug}] CF challenge solved — title={title[:40]!r}")
-                        except Exception:
-                            log.warning(f"Warmup [{slug}] CF challenge not solved in 35s — retrying")
+                        else:
+                            log.warning(f"Warmup [{slug}] CF challenge not solved after 60s — retrying")
 
                     if status == 200 and "just a moment" not in title.lower():
                         log.info(f"Warmup [{slug}] OK — HTTP {status}, title={title[:45]!r}")
@@ -417,23 +418,23 @@ async def _pw_fetch(
                 resp = await page.goto(url, **goto_kw)
                 status = resp.status if resp else 0
 
-                # Cloudflare JS challenge: "Just a moment..." — Playwright's real Chrome
-                # can solve it; we just need to wait for the JS to run and redirect.
+                # Cloudflare JS challenge: "Just a moment..." — wait for networkidle so
+                # Chrome's JS can complete the challenge XHR requests and redirect.
                 title_text = await page.title()
                 if "just a moment" in title_text.lower():
-                    log.info(f"CF challenge on attempt {attempt} — waiting 35s  [{url[:60]}]")
+                    log.info(f"CF challenge attempt {attempt} — waiting up to 60s (networkidle)  [{url[:60]}]")
                     try:
-                        await page.wait_for_function(
-                            "() => !document.title.toLowerCase().includes('just a moment')",
-                            timeout=35000,
-                        )
+                        await page.wait_for_load_state("networkidle", timeout=60000)
+                    except Exception:
+                        pass  # timeout — check title below
+                    title_text = await page.title()
+                    if "just a moment" not in title_text.lower():
                         log.info(f"CF challenge solved  [{url[:60]}]")
                         return await page.content()
-                    except Exception:
-                        log.warning(f"CF challenge not solved in 35s (attempt {attempt}/{max_attempts})  [{url[:60]}]")
-                        if attempt < max_attempts:
-                            await asyncio.sleep(5)
-                        continue
+                    log.warning(f"CF challenge not solved after 60s (attempt {attempt}/{max_attempts})  [{url[:60]}]")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(5)
+                    continue
 
                 if status == 200:
                     return await page.content()
