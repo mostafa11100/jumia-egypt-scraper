@@ -316,21 +316,35 @@ async def _init_playwright() -> bool:
         _pw_semaphore = asyncio.Semaphore(PW_CONCURRENCY)
         _pinned_ua = ua
 
-        # Warmup: load homepage + a category page to deepen the Cloudflare session
-        for warmup_url in [BASE_URL, f"{BASE_URL}/phones-tablets/"]:
-            page = await _pw_context.new_page()
-            try:
-                resp = await page.goto(warmup_url, wait_until="domcontentloaded", timeout=30000)
-                title = await page.title()
-                log.info(
-                    f"Playwright warmup OK — HTTP {resp.status if resp else '?'}, "
-                    f"url={warmup_url.split('/')[-2] or 'home'}, title={title[:50]!r}"
-                )
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                log.warning(f"Warmup {warmup_url}: {e}")
-            finally:
-                await page.close()
+        # Warmup: load 3 pages to establish a robust Cloudflare session.
+        # If a warmup page gets 403 / "Just a moment", retry it once before moving on.
+        warmup_urls = [
+            BASE_URL,
+            f"{BASE_URL}/phones-tablets/",
+            f"{BASE_URL}/electronics/",
+        ]
+        for warmup_url in warmup_urls:
+            for wup_attempt in range(2):
+                page = await _pw_context.new_page()
+                try:
+                    resp = await page.goto(warmup_url, wait_until="domcontentloaded", timeout=30000)
+                    status = resp.status if resp else 0
+                    title = await page.title()
+                    slug = warmup_url.rstrip("/").split("/")[-1] or "home"
+                    if status == 200 and "just a moment" not in title.lower():
+                        log.info(f"Warmup [{slug}] OK — HTTP {status}, title={title[:45]!r}")
+                        await asyncio.sleep(2.5)
+                        break  # success — move to next warmup URL
+                    else:
+                        log.warning(
+                            f"Warmup [{slug}] attempt {wup_attempt+1}: "
+                            f"HTTP {status}, title={title[:40]!r} — retrying in 10s"
+                        )
+                        await asyncio.sleep(10)
+                except Exception as e:
+                    log.warning(f"Warmup {warmup_url}: {e}")
+                finally:
+                    await page.close()
 
         return True
     except Exception as exc:
@@ -368,7 +382,7 @@ async def _pw_fetch(
         async with _pw_semaphore:
             page = None
             try:
-                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await asyncio.sleep(random.uniform(1.0, 2.5))
                 page = await _pw_context.new_page()
                 resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 status = resp.status if resp else 0
@@ -972,6 +986,8 @@ async def scrape_category(
 
     # ── Remaining pages: concurrent ───────────────────────────────────────────
     if total_pages > 1 and len(products) < limit:
+        # Brief pause so the Cloudflare session stabilises after first-page access
+        await asyncio.sleep(random.uniform(2.0, 4.0))
         sem = asyncio.Semaphore(PAGE_CONCURRENCY)
         sep = "&" if "?" in category_url else "?"
         extra_urls = [
