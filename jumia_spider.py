@@ -134,6 +134,7 @@ _pw_playwright: Optional[Any] = None
 _pw_browser:    Optional[Any] = None
 _pw_context:    Optional[Any] = None
 _pw_semaphore:  Optional[asyncio.Semaphore] = None
+_pw_stealth:    Optional[Any] = None   # playwright-stealth async function if available
 PW_CONCURRENCY = 12   # max concurrent Playwright tabs (each ~50-100 MB, 7GB RAM avail)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +274,7 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
                 so Cloudflare establishes a session for that exact path.
     Returns True on success.
     """
-    global _pw_playwright, _pw_browser, _pw_context, _pw_semaphore, _pinned_ua
+    global _pw_playwright, _pw_browser, _pw_context, _pw_semaphore, _pinned_ua, _pw_stealth
 
     ua = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -304,11 +305,24 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
             locale="en-US",
             timezone_id="Africa/Cairo",
         )
+        # Apply playwright-stealth for comprehensive anti-fingerprinting
+        try:
+            from playwright_stealth import stealth_async  # type: ignore
+            _pw_stealth = stealth_async
+            log.info("playwright-stealth available — will apply stealth to each page")
+        except ImportError:
+            _pw_stealth = None
+            log.warning("playwright-stealth not installed — using basic patches only")
+
+        # Basic fallback stealth patches (used when playwright-stealth is not available)
         await _pw_context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters);
         """)
         # Block images/fonts — speeds up page loads without hurting HTML content
         await _pw_context.route(
@@ -335,6 +349,8 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
             for wup_attempt in range(max_wup_attempts):
                 page = await _pw_context.new_page()
                 try:
+                    if _pw_stealth:
+                        await _pw_stealth(page)
                     goto_kw: dict = {"wait_until": "domcontentloaded", "timeout": 30000}
                     if wup_referer:
                         goto_kw["referer"] = wup_referer
@@ -344,20 +360,18 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
                     slug = warmup_url.rstrip("/").split("/")[-1] or "home"
 
                     # If Cloudflare serves a JS challenge ("Just a moment..."),
-                    # wait for networkidle so Chrome can execute the challenge JS,
-                    # complete its XHR requests to Cloudflare, and redirect to the real page.
+                    # poll for up to 90s for Chrome to solve it and redirect.
                     if "just a moment" in title.lower():
-                        log.info(f"Warmup [{slug}]: CF challenge — waiting up to 60s (networkidle) …")
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=60000)
-                        except Exception:
-                            pass  # timeout is fine — check title below
-                        title = await page.title()
-                        if "just a moment" not in title.lower():
-                            status = 200  # challenge solved → real page loaded
-                            log.info(f"Warmup [{slug}] CF challenge solved — title={title[:40]!r}")
+                        log.info(f"Warmup [{slug}]: CF challenge — polling 90s for Chrome to solve …")
+                        for _ in range(18):  # 18 × 5s = 90s max
+                            await asyncio.sleep(5)
+                            title = await page.title()
+                            if "just a moment" not in title.lower():
+                                status = 200
+                                log.info(f"Warmup [{slug}] CF challenge solved — title={title[:40]!r}")
+                                break
                         else:
-                            log.warning(f"Warmup [{slug}] CF challenge not solved after 60s — retrying")
+                            log.warning(f"Warmup [{slug}] CF challenge not solved after 90s — retrying")
 
                     if status == 200 and "just a moment" not in title.lower():
                         log.info(f"Warmup [{slug}] OK — HTTP {status}, title={title[:45]!r}")
@@ -412,26 +426,25 @@ async def _pw_fetch(
             try:
                 await asyncio.sleep(random.uniform(1.0, 2.5))
                 page = await _pw_context.new_page()
+                if _pw_stealth:
+                    await _pw_stealth(page)
                 goto_kw: dict = {"wait_until": "domcontentloaded", "timeout": 30000}
                 if referer:
                     goto_kw["referer"] = referer
                 resp = await page.goto(url, **goto_kw)
                 status = resp.status if resp else 0
 
-                # Cloudflare JS challenge: "Just a moment..." — wait for networkidle so
-                # Chrome's JS can complete the challenge XHR requests and redirect.
+                # Cloudflare JS challenge: poll for up to 90s for Chrome to solve it.
                 title_text = await page.title()
                 if "just a moment" in title_text.lower():
-                    log.info(f"CF challenge attempt {attempt} — waiting up to 60s (networkidle)  [{url[:60]}]")
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=60000)
-                    except Exception:
-                        pass  # timeout — check title below
-                    title_text = await page.title()
-                    if "just a moment" not in title_text.lower():
-                        log.info(f"CF challenge solved  [{url[:60]}]")
-                        return await page.content()
-                    log.warning(f"CF challenge not solved after 60s (attempt {attempt}/{max_attempts})  [{url[:60]}]")
+                    log.info(f"CF challenge attempt {attempt} — polling 90s  [{url[:60]}]")
+                    for _ in range(18):  # 18 × 5s = 90s max
+                        await asyncio.sleep(5)
+                        title_text = await page.title()
+                        if "just a moment" not in title_text.lower():
+                            log.info(f"CF challenge solved  [{url[:60]}]")
+                            return await page.content()
+                    log.warning(f"CF challenge not solved after 90s (attempt {attempt}/{max_attempts})  [{url[:60]}]")
                     if attempt < max_attempts:
                         await asyncio.sleep(5)
                     continue
