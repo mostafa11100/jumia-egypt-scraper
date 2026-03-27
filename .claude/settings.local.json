@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json; d=json.load\\(open\\(''D:/scarping_system/noon_github_scraper/products_0.json''\\)\\); print\\(list\\(d[0].keys\\(\\)\\) if d else ''empty''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python jumia_spider.py --mode discover)",
+      "Bash(python3 -c \":*)",
+      "Bash(python -c \":*)",
+      "Bash(python jumia_spider.py --mode export)",
+      "Bash(gh --version)",
+      "Bash(gh auth:*)",
+      "Bash(gh api:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh workflow:*)",
+      "Bash(gh run:*)"
+    ]
+  }
+}

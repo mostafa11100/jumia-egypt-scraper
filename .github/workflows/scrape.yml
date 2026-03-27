@@ -69,6 +69,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: Install Playwright browser
+        run: playwright install chromium --with-deps
+
       - name: "Scrape ${{ matrix.name }}"
         run: |
           python jumia_spider.py \

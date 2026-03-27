@@ -125,6 +125,9 @@ _GENERIC_NAMES = frozenset({
     "explore", "browse", "click here", "learn more",
 })
 
+# UA pinned when Playwright gets cf_clearance (must match for Cloudflare cookie to work)
+_pinned_ua: Optional[str] = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +148,7 @@ log = logging.getLogger(__name__)
 
 def build_headers(referer: str = BASE_URL) -> dict:
     """Build realistic Chrome131 browser headers."""
-    ua = random.choice(USER_AGENTS)
+    ua = _pinned_ua or random.choice(USER_AGENTS)
     headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -313,6 +316,89 @@ async def fetch(
 
     log.error(f"All {max_attempts} attempts failed: {url[:80]}")
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUDFLARE BYPASS  (Playwright-based cookie acquisition)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_cloudflare_cookies() -> dict[str, str]:
+    """
+    Launch headless Chromium via Playwright to pass the Cloudflare challenge.
+    Returns all session cookies (including cf_clearance) so curl-cffi can reuse them.
+    Also pins _pinned_ua to the UA used here so Cloudflare accepts the cookies.
+    """
+    global _pinned_ua
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.warning("playwright not installed — CF bypass unavailable")
+        return {}
+
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+    log.info("Playwright: launching Chromium to solve Cloudflare challenge …")
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                ],
+            )
+            ctx = await browser.new_context(
+                user_agent=ua,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="Africa/Cairo",
+            )
+            # Remove webdriver flag so Cloudflare doesn't detect headless Chrome
+            await ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+            """)
+            page = await ctx.new_page()
+            try:
+                resp = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                http_status = resp.status if resp else 0
+
+                # Wait up to 15 s for the JS challenge to resolve
+                for i in range(15):
+                    await asyncio.sleep(1)
+                    title = await page.title()
+                    if "just a moment" not in title.lower() and "checking" not in title.lower():
+                        log.info(f"Playwright page loaded: {title[:60]!r} (HTTP {http_status})")
+                        break
+                    log.debug(f"Waiting for CF challenge… [{i+1}s] title={title!r}")
+
+                cookies = await ctx.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies}
+
+                if "cf_clearance" in cookie_dict:
+                    log.info(f"CF clearance obtained! Injecting {len(cookies)} cookies into curl-cffi session.")
+                    _pinned_ua = ua  # curl-cffi must use the same UA for these cookies to work
+                else:
+                    log.warning(
+                        f"No cf_clearance after Playwright warmup (HTTP {http_status}). "
+                        f"Jumia may be blocking datacenter/Azure IPs at the ASN level. "
+                        f"Consider using a self-hosted GitHub Actions runner on a residential IP. "
+                        f"Cookies present: {list(cookie_dict.keys())}"
+                    )
+
+                return cookie_dict
+            finally:
+                await browser.close()
+    except Exception as exc:
+        log.error(f"Playwright CF bypass failed: {exc}")
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -899,7 +985,17 @@ def save_categories_csv(categories: list[dict], output_dir: str = "output"):
 
 async def async_main(args: argparse.Namespace) -> None:
 
+    # For scrape mode: use Playwright to acquire Cloudflare cookies BEFORE
+    # creating the curl-cffi session, so we can inject them immediately.
+    cf_cookies: dict[str, str] = {}
+    if args.mode == "scrape":
+        cf_cookies = await get_cloudflare_cookies()
+
     async with AsyncSession(impersonate="chrome131", timeout=REQUEST_TIMEOUT) as session:
+
+        # Inject Cloudflare cookies so curl-cffi requests are authenticated
+        if cf_cookies:
+            session.cookies.update(cf_cookies)
 
         # ── DISCOVER ─────────────────────────────────────────────────────────
         if args.mode == "discover":
@@ -920,9 +1016,12 @@ async def async_main(args: argparse.Namespace) -> None:
                 log.error("--category-url and --category-name are required for scrape mode.")
                 sys.exit(1)
 
-            # Session warm-up: visit homepage to get cookies
-            log.info("Session warm-up …")
-            await fetch(session, BASE_URL, referer=BASE_URL)
+            if cf_cookies:
+                log.info(f"Using {len(cf_cookies)} Playwright CF cookies — skipping curl-cffi warm-up")
+            else:
+                # Playwright unavailable / failed — fall back to direct warm-up
+                log.info("Session warm-up (curl-cffi) …")
+                await fetch(session, BASE_URL, referer=BASE_URL)
             await asyncio.sleep(random.uniform(1.0, 2.5))
 
             count = await scrape_category(
