@@ -319,22 +319,26 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
         _pinned_ua = ua
 
         # Warmup: load pages to establish a robust Cloudflare session.
-        # Each entry: (url, max_attempts, retry_sleep_seconds)
-        # The target category URL gets 5 attempts so it can recover from initial 403s.
-        warmup_entries: list[tuple[str, int, int]] = [
-            (BASE_URL,                          2, 10),
-            (f"{BASE_URL}/phones-tablets/",     2, 10),
-            (f"{BASE_URL}/electronics/",        2, 10),
+        # Each entry: (url, max_attempts, retry_sleep_seconds, referer_for_goto)
+        # The target category URL uses BASE_URL as referer (simulates navigating from
+        # the homepage) and gets 5 attempts with 20s retry sleep.
+        warmup_entries: list[tuple[str, int, int, str]] = [
+            (BASE_URL,                          2, 10, ""),
+            (f"{BASE_URL}/phones-tablets/",     2, 10, BASE_URL),
+            (f"{BASE_URL}/electronics/",        2, 10, BASE_URL),
         ]
         if target_url:
             abs_target = target_url if target_url.startswith("http") else BASE_URL + target_url
-            warmup_entries.append((abs_target, 5, 20))
+            warmup_entries.append((abs_target, 5, 20, BASE_URL))
 
-        for warmup_url, max_wup_attempts, wup_retry_sleep in warmup_entries:
+        for warmup_url, max_wup_attempts, wup_retry_sleep, wup_referer in warmup_entries:
             for wup_attempt in range(max_wup_attempts):
                 page = await _pw_context.new_page()
                 try:
-                    resp = await page.goto(warmup_url, wait_until="domcontentloaded", timeout=30000)
+                    goto_kw: dict = {"wait_until": "domcontentloaded", "timeout": 30000}
+                    if wup_referer:
+                        goto_kw["referer"] = wup_referer
+                    resp = await page.goto(warmup_url, **goto_kw)
                     status = resp.status if resp else 0
                     title = await page.title()
                     slug = warmup_url.rstrip("/").split("/")[-1] or "home"
@@ -391,7 +395,10 @@ async def _pw_fetch(
             try:
                 await asyncio.sleep(random.uniform(1.0, 2.5))
                 page = await _pw_context.new_page()
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                goto_kw: dict = {"wait_until": "domcontentloaded", "timeout": 30000}
+                if referer:
+                    goto_kw["referer"] = referer
+                resp = await page.goto(url, **goto_kw)
                 status = resp.status if resp else 0
 
                 if status == 200:
