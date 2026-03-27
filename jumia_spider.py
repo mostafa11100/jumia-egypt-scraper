@@ -265,10 +265,12 @@ def slug_to_name(slug: str) -> str:
 # PLAYWRIGHT BROWSER  (primary HTTP engine — bypasses Cloudflare Bot Management)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _init_playwright() -> bool:
+async def _init_playwright(target_url: Optional[str] = None) -> bool:
     """
     Start a persistent headless Chromium context with stealth patches.
     All fetch() calls route through this context when it is active.
+    target_url: if provided, it is added as the final warmup URL (5 retries)
+                so Cloudflare establishes a session for that exact path.
     Returns True on success.
     """
     global _pw_playwright, _pw_browser, _pw_context, _pw_semaphore, _pinned_ua
@@ -316,15 +318,20 @@ async def _init_playwright() -> bool:
         _pw_semaphore = asyncio.Semaphore(PW_CONCURRENCY)
         _pinned_ua = ua
 
-        # Warmup: load 3 pages to establish a robust Cloudflare session.
-        # If a warmup page gets 403 / "Just a moment", retry it once before moving on.
-        warmup_urls = [
-            BASE_URL,
-            f"{BASE_URL}/phones-tablets/",
-            f"{BASE_URL}/electronics/",
+        # Warmup: load pages to establish a robust Cloudflare session.
+        # Each entry: (url, max_attempts, retry_sleep_seconds)
+        # The target category URL gets 5 attempts so it can recover from initial 403s.
+        warmup_entries: list[tuple[str, int, int]] = [
+            (BASE_URL,                          2, 10),
+            (f"{BASE_URL}/phones-tablets/",     2, 10),
+            (f"{BASE_URL}/electronics/",        2, 10),
         ]
-        for warmup_url in warmup_urls:
-            for wup_attempt in range(2):
+        if target_url:
+            abs_target = target_url if target_url.startswith("http") else BASE_URL + target_url
+            warmup_entries.append((abs_target, 5, 20))
+
+        for warmup_url, max_wup_attempts, wup_retry_sleep in warmup_entries:
+            for wup_attempt in range(max_wup_attempts):
                 page = await _pw_context.new_page()
                 try:
                     resp = await page.goto(warmup_url, wait_until="domcontentloaded", timeout=30000)
@@ -337,10 +344,10 @@ async def _init_playwright() -> bool:
                         break  # success — move to next warmup URL
                     else:
                         log.warning(
-                            f"Warmup [{slug}] attempt {wup_attempt+1}: "
-                            f"HTTP {status}, title={title[:40]!r} — retrying in 10s"
+                            f"Warmup [{slug}] attempt {wup_attempt+1}/{max_wup_attempts}: "
+                            f"HTTP {status}, title={title[:40]!r} — retrying in {wup_retry_sleep}s"
                         )
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(wup_retry_sleep)
                 except Exception as e:
                     log.warning(f"Warmup {warmup_url}: {e}")
                 finally:
@@ -1104,7 +1111,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
     # For scrape mode: start the persistent Playwright browser (bypasses Cloudflare)
     if args.mode == "scrape":
-        await _init_playwright()
+        await _init_playwright(target_url=args.category_url if args.category_url else None)
 
     async with AsyncSession(impersonate="chrome131", timeout=REQUEST_TIMEOUT) as session:
 
