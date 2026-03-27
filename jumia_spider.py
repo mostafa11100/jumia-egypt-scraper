@@ -34,6 +34,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+import math
 from typing import Any, Optional
 from urllib.parse import urljoin
 
@@ -315,14 +316,21 @@ async def _init_playwright() -> bool:
         _pw_semaphore = asyncio.Semaphore(PW_CONCURRENCY)
         _pinned_ua = ua
 
-        # Homepage warmup — establishes Cloudflare session cookies in the browser
-        page = await _pw_context.new_page()
-        try:
-            resp = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
-            title = await page.title()
-            log.info(f"Playwright warmup OK — HTTP {resp.status if resp else '?'}, title={title[:50]!r}")
-        finally:
-            await page.close()
+        # Warmup: load homepage + a category page to deepen the Cloudflare session
+        for warmup_url in [BASE_URL, f"{BASE_URL}/phones-tablets/"]:
+            page = await _pw_context.new_page()
+            try:
+                resp = await page.goto(warmup_url, wait_until="domcontentloaded", timeout=30000)
+                title = await page.title()
+                log.info(
+                    f"Playwright warmup OK — HTTP {resp.status if resp else '?'}, "
+                    f"url={warmup_url.split('/')[-2] or 'home'}, title={title[:50]!r}"
+                )
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                log.warning(f"Warmup {warmup_url}: {e}")
+            finally:
+                await page.close()
 
         return True
     except Exception as exc:
@@ -543,31 +551,59 @@ async def fetch_categories(session: AsyncSession) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_total_pages(soup: BeautifulSoup) -> int:
-    """Extract total page count from any Jumia pagination pattern."""
+    """Extract total page count from Jumia pagination patterns."""
 
-    # 1. aria-label="Page X of Y"
+    # ── Pattern 1: "1 – 40 of 2,160" counting string (most reliable) ─────────
+    # Jumia shows this in a .-pvS section; commas must be stripped from numbers
+    _showing = re.compile(
+        r"(\d[\d,]*)\s*[–\-]\s*(\d[\d,]*)\s+of\s+([\d,]+)", re.I
+    )
+    for text in soup.stripped_strings:
+        m = _showing.search(text.replace("\u00a0", " "))
+        if m:
+            start    = int(m.group(1).replace(",", ""))
+            end      = int(m.group(2).replace(",", ""))
+            total    = int(m.group(3).replace(",", ""))
+            per_page = max(end - start + 1, 1)
+            if total > 1:
+                return min(math.ceil(total / per_page), MAX_PAGES)
+
+    # ── Pattern 2: aria-label="Page N of Y" on pagination links ─────────────
     for a in soup.select("a[aria-label]"):
-        m = re.search(r"Page\s+\d+\s+of\s+(\d+)", a.get("aria-label", ""), re.I)
+        m = re.search(r"page\s+\d+\s+of\s+(\d+)", a.get("aria-label", ""), re.I)
         if m:
             return min(int(m.group(1)), MAX_PAGES)
 
-    # 2. span/div text "X of Y" or "Page X / Y"
-    for el in soup.select(".-pvS, .pg-i, [class*='pg-i'], [class*='show-page']"):
-        m = re.search(r"of\s+(\d+)", el.get_text())
+    # ── Pattern 3: highest page=N in pagination href attributes ─────────────
+    for a in soup.find_all("a", href=re.compile(r"[?&]page=(\d+)")):
+        pass  # collect all, then pick max
+    page_nums = []
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"[?&]page=(\d+)", a["href"])
         if m:
-            return min(int(m.group(1)), MAX_PAGES)
+            page_nums.append(int(m.group(1)))
+    if page_nums:
+        return min(max(page_nums), MAX_PAGES)
 
-    # 3. Numbered page links — take the highest number
-    pag = soup.select_one(".-pag, .pg, [class*='pag']")
-    if pag:
-        nums = [int(a.text) for a in pag.find_all("a") if a.text.strip().isdigit()]
-        if nums:
+    # ── Pattern 4: highest digit-only link text in a pagination container ────
+    for sel in [".-pag", ".pg", "nav", "[class*='pag']"]:
+        container = soup.select_one(sel)
+        if not container:
+            continue
+        nums = []
+        for a in container.find_all("a"):
+            t = a.get_text(strip=True).replace(",", "")
+            if t.isdigit():
+                nums.append(int(t))
+        if nums and max(nums) > 1:
             return min(max(nums), MAX_PAGES)
 
-    # 4. data-total / data-pages attribute
-    for el in soup.select("[data-total], [data-pages]"):
-        val = el.get("data-total") or el.get("data-pages", "")
-        if val.isdigit():
+    # ── Pattern 5: data attributes ───────────────────────────────────────────
+    for el in soup.select("[data-total], [data-pages], [data-page-count]"):
+        val = (
+            el.get("data-total") or el.get("data-pages") or el.get("data-page-count", "")
+        ).replace(",", "")
+        if val.isdigit() and int(val) > 1:
             return min(int(val), MAX_PAGES)
 
     return 1
