@@ -1,0 +1,120 @@
+name: Jumia Scraper
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # Daily at 04:00 AM Egypt time (UTC+2)
+  workflow_dispatch:       # Manual trigger from GitHub UI
+
+jobs:
+  # ── Step 1: Discover all categories ────────────────────────────────────────
+  discover:
+    name: Discover Categories
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Discover categories
+        id: set-matrix
+        run: |
+          python jumia_spider.py --mode discover
+          MATRIX=$(python3 - <<'EOF'
+          import json, sys
+          cats = json.load(open("categories.json", encoding="utf-8"))
+          matrix = {
+              "include": [
+                  {"name": c["name"], "url": c["url"], "idx": i}
+                  for i, c in enumerate(cats)
+              ]
+          }
+          print(json.dumps(matrix))
+          EOF
+          )
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+      - name: Upload categories artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: categories
+          path: |
+            categories.json
+            output/jumia_categories_*.csv
+
+  # ── Step 2: Scrape each category in parallel (different IPs) ───────────────
+  scrape:
+    name: "Scrape: ${{ matrix.name }}"
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 20      # 20 runners simultaneously = 20 different IPs
+      fail-fast: false      # Continue other categories even if one fails
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: "Scrape ${{ matrix.name }}"
+        run: |
+          python jumia_spider.py \
+            --mode scrape \
+            --category-name "${{ matrix.name }}" \
+            --category-url  "${{ matrix.url }}" \
+            --group-index   ${{ matrix.idx }} \
+            --limit 5000 \
+            --deep
+        timeout-minutes: 90
+
+      - name: Upload products artifact
+        if: always()   # Upload even if scrape partially failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: "products-${{ matrix.idx }}"
+          path: "products_${{ matrix.idx }}.json"
+
+  # ── Step 3: Merge all JSONs into one CSV ────────────────────────────────────
+  export:
+    name: Export CSV
+    needs: scrape
+    if: always()   # Run even if some scrape jobs failed
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download all product artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .    # Each artifact goes into its own sub-directory
+
+      - name: Merge JSON → CSV
+        run: python jumia_spider.py --mode export
+
+      - name: Upload final CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: jumia-products-csv
+          path: output/jumia_products_*.csv
+          retention-days: 30
