@@ -34,7 +34,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -125,8 +125,15 @@ _GENERIC_NAMES = frozenset({
     "explore", "browse", "click here", "learn more",
 })
 
-# UA pinned when Playwright gets cf_clearance (must match for Cloudflare cookie to work)
+# UA pinned when Playwright is active (all requests use the same UA as the browser)
 _pinned_ua: Optional[str] = None
+
+# Playwright browser state — set by _init_playwright(), used by _pw_fetch()
+_pw_playwright: Optional[Any] = None
+_pw_browser:    Optional[Any] = None
+_pw_context:    Optional[Any] = None
+_pw_semaphore:  Optional[asyncio.Semaphore] = None
+PW_CONCURRENCY = 8    # max concurrent Playwright tabs (each ~50-100 MB RAM)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -254,7 +261,142 @@ def slug_to_name(slug: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP CLIENT  (curl-cffi  +  adaptive rate-limiting)
+# PLAYWRIGHT BROWSER  (primary HTTP engine — bypasses Cloudflare Bot Management)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _init_playwright() -> bool:
+    """
+    Start a persistent headless Chromium context with stealth patches.
+    All fetch() calls route through this context when it is active.
+    Returns True on success.
+    """
+    global _pw_playwright, _pw_browser, _pw_context, _pw_semaphore, _pinned_ua
+
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.warning("playwright not installed — falling back to curl-cffi (may get 403)")
+        return False
+
+    log.info("Initializing Playwright Chromium (stealth) …")
+    try:
+        _pw_playwright = await async_playwright().start()
+        _pw_browser = await _pw_playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+            ],
+        )
+        _pw_context = await _pw_browser.new_context(
+            user_agent=ua,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="Africa/Cairo",
+        )
+        await _pw_context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+        """)
+        # Block images/fonts — speeds up page loads without hurting HTML content
+        await _pw_context.route(
+            "**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}",
+            lambda r: r.abort(),
+        )
+        _pw_semaphore = asyncio.Semaphore(PW_CONCURRENCY)
+        _pinned_ua = ua
+
+        # Homepage warmup — establishes Cloudflare session cookies in the browser
+        page = await _pw_context.new_page()
+        try:
+            resp = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+            title = await page.title()
+            log.info(f"Playwright warmup OK — HTTP {resp.status if resp else '?'}, title={title[:50]!r}")
+        finally:
+            await page.close()
+
+        return True
+    except Exception as exc:
+        log.error(f"Playwright init failed: {exc}")
+        _pw_context = None
+        return False
+
+
+async def _close_playwright() -> None:
+    """Shut down the Playwright browser cleanly."""
+    global _pw_playwright, _pw_browser, _pw_context
+    try:
+        if _pw_browser:
+            await _pw_browser.close()
+        if _pw_playwright:
+            await _pw_playwright.stop()
+    except Exception:
+        pass
+    finally:
+        _pw_browser = None
+        _pw_context = None
+        _pw_playwright = None
+
+
+async def _pw_fetch(
+    url: str,
+    referer: str = BASE_URL,
+    max_attempts: int = 3,
+) -> Optional[str]:
+    """Fetch a URL through the persistent Playwright context (Cloudflare-safe)."""
+    if _pw_context is None or _pw_semaphore is None:
+        return None
+
+    for attempt in range(1, max_attempts + 1):
+        async with _pw_semaphore:
+            page = None
+            try:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                page = await _pw_context.new_page()
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                status = resp.status if resp else 0
+
+                if status == 200:
+                    return await page.content()
+                elif status == 429:
+                    pause = random.uniform(*RATE_LIMIT_PAUSE)
+                    log.warning(f"429 (PW) → pause {pause:.0f}s  [{url[:60]}]")
+                    await asyncio.sleep(pause)
+                elif status == 403:
+                    log.warning(f"403 (PW, attempt {attempt}/{max_attempts})  [{url[:60]}]")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(30)
+                elif status == 404:
+                    return None
+                else:
+                    log.warning(f"HTTP {status} (PW, attempt {attempt})  [{url[:60]}]")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(5)
+            except Exception as exc:
+                log.warning(f"PW fetch error attempt {attempt}: {exc}  [{url[:60]}]")
+                await asyncio.sleep(random.uniform(3, 8))
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+    log.error(f"All Playwright attempts failed: {url[:80]}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP CLIENT  (routes to Playwright when active, curl-cffi as fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch(
@@ -265,8 +407,14 @@ async def fetch(
 ) -> Optional[str]:
     """
     GET a URL and return HTML text.
-    Handles 429 / 5xx with adaptive back-off; returns None after all retries.
+    Uses Playwright (Cloudflare-bypassing) when the browser context is active;
+    falls back to curl-cffi with adaptive back-off otherwise.
     """
+    # ── Playwright path ───────────────────────────────────────────────────────
+    if _pw_context is not None:
+        return await _pw_fetch(url, referer, max_attempts)
+
+    # ── curl-cffi fallback ────────────────────────────────────────────────────
     consecutive_5xx = 0
 
     for attempt in range(1, max_attempts + 1):
@@ -316,89 +464,6 @@ async def fetch(
 
     log.error(f"All {max_attempts} attempts failed: {url[:80]}")
     return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLOUDFLARE BYPASS  (Playwright-based cookie acquisition)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def get_cloudflare_cookies() -> dict[str, str]:
-    """
-    Launch headless Chromium via Playwright to pass the Cloudflare challenge.
-    Returns all session cookies (including cf_clearance) so curl-cffi can reuse them.
-    Also pins _pinned_ua to the UA used here so Cloudflare accepts the cookies.
-    """
-    global _pinned_ua
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        log.warning("playwright not installed — CF bypass unavailable")
-        return {}
-
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    )
-    log.info("Playwright: launching Chromium to solve Cloudflare challenge …")
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-size=1920,1080",
-                ],
-            )
-            ctx = await browser.new_context(
-                user_agent=ua,
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="Africa/Cairo",
-            )
-            # Remove webdriver flag so Cloudflare doesn't detect headless Chrome
-            await ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-            """)
-            page = await ctx.new_page()
-            try:
-                resp = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
-                http_status = resp.status if resp else 0
-
-                # Wait up to 15 s for the JS challenge to resolve
-                for i in range(15):
-                    await asyncio.sleep(1)
-                    title = await page.title()
-                    if "just a moment" not in title.lower() and "checking" not in title.lower():
-                        log.info(f"Playwright page loaded: {title[:60]!r} (HTTP {http_status})")
-                        break
-                    log.debug(f"Waiting for CF challenge… [{i+1}s] title={title!r}")
-
-                cookies = await ctx.cookies()
-                cookie_dict = {c["name"]: c["value"] for c in cookies}
-
-                if "cf_clearance" in cookie_dict:
-                    log.info(f"CF clearance obtained! Injecting {len(cookies)} cookies into curl-cffi session.")
-                    _pinned_ua = ua  # curl-cffi must use the same UA for these cookies to work
-                else:
-                    log.warning(
-                        f"No cf_clearance after Playwright warmup (HTTP {http_status}). "
-                        f"Jumia may be blocking datacenter/Azure IPs at the ASN level. "
-                        f"Consider using a self-hosted GitHub Actions runner on a residential IP. "
-                        f"Cookies present: {list(cookie_dict.keys())}"
-                    )
-
-                return cookie_dict
-            finally:
-                await browser.close()
-    except Exception as exc:
-        log.error(f"Playwright CF bypass failed: {exc}")
-        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -985,17 +1050,11 @@ def save_categories_csv(categories: list[dict], output_dir: str = "output"):
 
 async def async_main(args: argparse.Namespace) -> None:
 
-    # For scrape mode: use Playwright to acquire Cloudflare cookies BEFORE
-    # creating the curl-cffi session, so we can inject them immediately.
-    cf_cookies: dict[str, str] = {}
+    # For scrape mode: start the persistent Playwright browser (bypasses Cloudflare)
     if args.mode == "scrape":
-        cf_cookies = await get_cloudflare_cookies()
+        await _init_playwright()
 
     async with AsyncSession(impersonate="chrome131", timeout=REQUEST_TIMEOUT) as session:
-
-        # Inject Cloudflare cookies so curl-cffi requests are authenticated
-        if cf_cookies:
-            session.cookies.update(cf_cookies)
 
         # ── DISCOVER ─────────────────────────────────────────────────────────
         if args.mode == "discover":
@@ -1016,12 +1075,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 log.error("--category-url and --category-name are required for scrape mode.")
                 sys.exit(1)
 
-            if cf_cookies:
-                log.info(f"Using {len(cf_cookies)} Playwright CF cookies — skipping curl-cffi warm-up")
-            else:
-                # Playwright unavailable / failed — fall back to direct warm-up
-                log.info("Session warm-up (curl-cffi) …")
-                await fetch(session, BASE_URL, referer=BASE_URL)
+            # Playwright warmup was done in _init_playwright(); add a short delay
             await asyncio.sleep(random.uniform(1.0, 2.5))
 
             count = await scrape_category(
@@ -1032,6 +1086,8 @@ async def async_main(args: argparse.Namespace) -> None:
                 limit=args.limit,
                 deep=args.deep,
             )
+
+            await _close_playwright()
 
             if count == 0:
                 log.warning("No products scraped — check the category URL.")
