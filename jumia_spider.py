@@ -342,6 +342,22 @@ async def _init_playwright(target_url: Optional[str] = None) -> bool:
                     status = resp.status if resp else 0
                     title = await page.title()
                     slug = warmup_url.rstrip("/").split("/")[-1] or "home"
+
+                    # If Cloudflare serves a JS challenge ("Just a moment..."),
+                    # wait for real Chrome to solve it and redirect to the real page.
+                    if "just a moment" in title.lower():
+                        log.info(f"Warmup [{slug}]: CF challenge — waiting up to 35s for Chrome to solve …")
+                        try:
+                            await page.wait_for_function(
+                                "() => !document.title.toLowerCase().includes('just a moment')",
+                                timeout=35000,
+                            )
+                            title = await page.title()
+                            status = 200  # challenge solved → real page loaded
+                            log.info(f"Warmup [{slug}] CF challenge solved — title={title[:40]!r}")
+                        except Exception:
+                            log.warning(f"Warmup [{slug}] CF challenge not solved in 35s — retrying")
+
                     if status == 200 and "just a moment" not in title.lower():
                         log.info(f"Warmup [{slug}] OK — HTTP {status}, title={title[:45]!r}")
                         await asyncio.sleep(2.5)
@@ -400,6 +416,24 @@ async def _pw_fetch(
                     goto_kw["referer"] = referer
                 resp = await page.goto(url, **goto_kw)
                 status = resp.status if resp else 0
+
+                # Cloudflare JS challenge: "Just a moment..." — Playwright's real Chrome
+                # can solve it; we just need to wait for the JS to run and redirect.
+                title_text = await page.title()
+                if "just a moment" in title_text.lower():
+                    log.info(f"CF challenge on attempt {attempt} — waiting 35s  [{url[:60]}]")
+                    try:
+                        await page.wait_for_function(
+                            "() => !document.title.toLowerCase().includes('just a moment')",
+                            timeout=35000,
+                        )
+                        log.info(f"CF challenge solved  [{url[:60]}]")
+                        return await page.content()
+                    except Exception:
+                        log.warning(f"CF challenge not solved in 35s (attempt {attempt}/{max_attempts})  [{url[:60]}]")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(5)
+                        continue
 
                 if status == 200:
                     return await page.content()
