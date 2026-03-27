@@ -49,10 +49,10 @@ from tqdm import tqdm
 BASE_URL         = "https://www.jumia.com.eg"
 PRODUCT_LIMIT    = 5000
 MAX_PAGES        = 200
-PAGE_CONCURRENCY = 5      # concurrent listing pages per category
-DETAIL_CONCURRENCY = 3    # concurrent product detail fetches
+PAGE_CONCURRENCY = 8      # concurrent listing pages per category
+DETAIL_CONCURRENCY = 8    # concurrent product detail fetches
 PAGE_DELAY       = (0.8, 1.8)    # seconds between page requests
-DETAIL_DELAY     = (1.0, 2.5)    # seconds between detail requests
+DETAIL_DELAY     = (0.2, 0.5)    # seconds between detail requests (Playwright handles its own latency)
 RATE_LIMIT_PAUSE = (15, 45)      # seconds to wait on 429
 SERVER_ERR_PAUSE = (30, 60)      # seconds to wait on 5xx
 REQUEST_TIMEOUT  = 30
@@ -134,7 +134,7 @@ _pw_playwright: Optional[Any] = None
 _pw_browser:    Optional[Any] = None
 _pw_context:    Optional[Any] = None
 _pw_semaphore:  Optional[asyncio.Semaphore] = None
-PW_CONCURRENCY = 8    # max concurrent Playwright tabs (each ~50-100 MB RAM)
+PW_CONCURRENCY = 12   # max concurrent Playwright tabs (each ~50-100 MB, 7GB RAM avail)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
